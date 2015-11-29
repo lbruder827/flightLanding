@@ -16,6 +16,9 @@
  *                 DEFINES               *
  *****************************************/
 
+#define COLLECTION_RATE_MS  (uint8_t)100
+
+
 /*****************************************
  *                 TYPEDEFS              *
  *****************************************/
@@ -24,16 +27,23 @@
  * State enumerations
  */
 typedef enum{
-  STATE_OFF, STATE_WIFI_ON, STATE_RECORDING_ON 
+  /*
+   * First enters this state when turned on
+   */
+  STATE_WIFI_ON,
+  STATE_RECORDING   // Recording data, wifi is off
 } flightLanding_state_E;
 
 /**
  * Struct containing all information
  */
 typedef struct{
+  // State related information
   flightLanding_state_E present_state;
   flightLanding_state_E desired_state;
   bool state_transition;
+
+  uint32_t last_time_collected_ms;
 } flightLanding_data_S;
 
 /*****************************************
@@ -46,7 +56,8 @@ static void flightLanding_private_getDesiredState(void);
 static void flightLanding_private_setCurrentState(void);
 
 // Tranisitions
-static bool flightLanding_private_allowTransitionOffToOn(void);
+static bool flightLanding_private_allowTransitionWifiOnToRecording(void);
+static bool flightLanding_private_allowTransitionRecordingToWifiOn(void);
 
 
 /*****************************************
@@ -59,9 +70,23 @@ static flightLanding_data_S flightLanding_data;
  *           PRIVATE FUNCTIONS           *
  *****************************************/
 
-static bool flightLanding_private_allowTransitionOffToOn(void)
+static bool flightLanding_private_allowTransitionWifiOnToRecording(void)
 {
   bool allowTransition = false;
+
+  // make a new file on the SD card if transition is allowed
+  // make sure the acceleration and gyroscopic data is calibrated before allowing transition
+  // need a way to make this evident to the user
+  // https://learn.adafruit.com/adafruit-bno055-absolute-orientation-sensor/device-calibration
+
+  return allowTransition;
+}
+
+static bool flightLanding_private_allowTransitionRecordingToWifiOn(void)
+{
+  bool allowTransition = false;
+
+  // if transition is allowed to turn on wifi, close the file on the SD card
 
   return allowTransition;
 }
@@ -71,7 +96,7 @@ static bool flightLanding_private_allowTransitionOffToOn(void)
  */
 static void flightLanding_private_processData(void)
 {
-  int x = 1;
+  // grab button presses
 }
 
 /**
@@ -83,12 +108,10 @@ static void flightLanding_private_getDesiredState(void)
 
   switch(presentState)
   {
-    case STATE_OFF:
-    
-      // JUST AN EXAMPLE
-      if(flightLanding_private_allowTransitionOffToOn() == true)
+    case STATE_WIFI_ON:
+      if(flightLanding_private_allowTransitionWifiOnToRecording() == true)
       {
-        presentState = STATE_WIFI_ON;
+        presentState = STATE_RECORDING;
       }
       else
       {
@@ -96,9 +119,20 @@ static void flightLanding_private_getDesiredState(void)
       }
       
       break;
+      
+    case STATE_RECORDING:
+      if(flightLanding_private_allowTransitionRecordingToWifiOn() == true)
+      {
+        presentState = STATE_WIFI_ON;
+      }
+      else
+      {
+        // keep state
+      }
+      break;
 
     default:
-      // log error, should never get here
+      // log error, should never get to this point
     break;
       
   }
@@ -115,14 +149,36 @@ static void flightLanding_private_setCurrentState(void)
 
   switch(desiredState)
   {
-    case STATE_OFF:
+    case STATE_WIFI_ON:
       if(flightLanding_data.state_transition == true)
       {
-        // do transition specific behavior in here
+        // transition specific behavior
+        
+        // turn on wifi
+
       }
 
       // do general state behavior here
+      // have wifi file take care of this for different commands
 
+      break;
+
+    case STATE_RECORDING:
+      if(flightLanding_data.state_transition == true)
+      {
+        // transition specific behavior
+        
+        // turn off wifi
+        // turn on IMU
+      }
+      
+      // grab data every COLLECTION_RATE_MS
+      if(millis() - flightLanding_data.last_time_collected_ms > COLLECTION_RATE_MS)
+      {
+        // grab data from IMU and barometer
+        // write data to SD file
+        flightLanding_data.last_time_collected_ms = millis();
+      }
       break;
 
     default:
@@ -140,7 +196,7 @@ static void flightLanding_private_setCurrentState(void)
  
 void setup() 
 {
-      // initialize flightLanding_data
+      // initialize flightLanding_data struct and state
 }
 
 void loop() 
