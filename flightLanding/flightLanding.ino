@@ -16,8 +16,16 @@
  *                 DEFINES               *
  *****************************************/
 
-#define COLLECTION_RATE_MS  (uint8_t)100
+#define COLLECTION_RATE_MS    (uint8_t)100
 
+#define esp_8266_serial       Serial1
+#define ESP_8266_SERIAL_BAUD  115200
+
+#define pc_serial             Serial
+#define PC_SERIAL_BAUD        9600
+
+#define PIN_ESP8266_CHIP_POWERDOWN  (uint8_t)2U
+#define PIN_ESP8266_RESET           (uint8_t)3U
 
 /*****************************************
  *                 TYPEDEFS              *
@@ -31,7 +39,14 @@ typedef enum{
    * First enters this state when turned on
    */
   STATE_WIFI_ON,
-  STATE_RECORDING   // Recording data, wifi is off
+  /*
+   * Recording data, wifi is off
+   */
+  STATE_RECORDING,
+  /*
+   * DEBUG state
+   */
+   STATE_DEBUG
 } flightLanding_state_E;
 
 /**
@@ -43,8 +58,10 @@ typedef struct{
   flightLanding_state_E desired_state;
   bool state_transition;
 
+  // Last time we measured data
   uint32_t last_time_collected_ms;
 } flightLanding_data_S;
+
 
 /*****************************************
  *             FUNCTION HEADERS          *
@@ -58,18 +75,64 @@ static void flightLanding_private_setCurrentState(void);
 // Tranisitions
 static bool flightLanding_private_allowTransitionWifiOnToRecording(void);
 static bool flightLanding_private_allowTransitionRecordingToWifiOn(void);
+static bool flightLanding_private_allowTransitionWifiOnToDebug(void);
+static bool flightLanding_private_allowTransitionDebugToWifiOn(void);
 
+static bool flightLanding_private_setupTCPServer(void);
+static void flightLanding_private_turnOnWifi(bool on);
 
 /*****************************************
  *             STATIC VARIABLES          *
  *****************************************/
 
+// State machine and other related information
 static flightLanding_data_S flightLanding_data;
+
+// Log file
+static const String LOG_FILE = "log.txt";
+
+// Commands initially sent to wifi to setup TCP server
+static const String ESP8266_SETUP_CONNECTION = "AT+CIPMUX=1"; // allow multiple connections
+static const String ESP8266_SETUP_PORT = "AT+CIPSERVER=1,1336"; // setup TCP server on port 1336
 
 /*****************************************
  *           PRIVATE FUNCTIONS           *
  *****************************************/
 
+/**
+ *  @brief  Check to see if we can transition from debugging the device back to normal operation
+ *  
+ *  @return TRUE if transition from debug state to wifi state is allowed
+ *          FALSE if we should stay in the debug state
+ */
+static bool flightLanding_private_allowTransitionDebugToWifiOn(void)
+{
+  bool allowTransition = false;
+
+  return allowTransition;
+}
+
+/**
+ *  @brief  Check to see if we can transition from wifi on/normal operation to debug mode
+ *  
+ *  @return TRUE if transition from normal operation to debugging the device
+ *          FALSE if we should stay in the wifi state
+ */
+static bool flightLanding_private_allowTransitionWifiOnToDebug(void)
+{
+  bool allowTransition = false;
+
+  // This would be entered if we logged into telnet server and entered in special debug command 
+
+  return allowTransition;
+}
+
+/**
+ *  @brief  Check to see if we can transition from wifi on to recording data
+ *  
+ *  @return TRUE if transition from wifi on to recording
+ *          FALSE if we should stay in the wifi state
+ */
 static bool flightLanding_private_allowTransitionWifiOnToRecording(void)
 {
   bool allowTransition = false;
@@ -82,6 +145,12 @@ static bool flightLanding_private_allowTransitionWifiOnToRecording(void)
   return allowTransition;
 }
 
+/**
+ *  @brief  Check to see if we can transition from recording back to normal wifi on state
+ *  
+ *  @return TRUE if transition from recording to wifi on state
+ *          FALSE if we should stay in the recording state
+ */
 static bool flightLanding_private_allowTransitionRecordingToWifiOn(void)
 {
   bool allowTransition = false;
@@ -100,7 +169,7 @@ static void flightLanding_private_processData(void)
 }
 
 /**
- * Find the desired state based on inputs
+ * Find the desired state based on inputs. Performs state transitions here
  */
 static void flightLanding_private_getDesiredState(void)
 {
@@ -112,6 +181,10 @@ static void flightLanding_private_getDesiredState(void)
       if(flightLanding_private_allowTransitionWifiOnToRecording() == true)
       {
         presentState = STATE_RECORDING;
+      }
+      else if(flightLanding_private_allowTransitionWifiOnToDebug() == true)
+      {
+        presentState = STATE_DEBUG;
       }
       else
       {
@@ -130,6 +203,16 @@ static void flightLanding_private_getDesiredState(void)
         // keep state
       }
       break;
+
+    case STATE_DEBUG:
+      if(flightLanding_private_allowTransitionDebugToWifiOn() == true)
+      {
+        presentState = STATE_WIFI_ON;
+      }
+      else
+      {
+        // keep state
+      }
 
     default:
       // log error, should never get to this point
@@ -153,7 +236,6 @@ static void flightLanding_private_setCurrentState(void)
       if(flightLanding_data.state_transition == true)
       {
         // transition specific behavior
-        
         // turn on wifi
 
       }
@@ -181,6 +263,16 @@ static void flightLanding_private_setCurrentState(void)
       }
       break;
 
+    case STATE_DEBUG:
+      if(flightLanding_data.state_transition == true)
+      {
+        // transition specific behavior
+      }
+ 
+      // normal behavior
+
+      break;
+
     default:
       // should never get here, log error
       break;
@@ -189,6 +281,86 @@ static void flightLanding_private_setCurrentState(void)
   flightLanding_data.desired_state = desiredState;
 }
 
+/**
+ * @brief run the AT commands required to setup the TCP server on the device.
+ * 
+ * @return TRUE if it was setup successfully, FALSE if there was an error
+ */
+static bool flightLanding_private_setupTCPServer(void)
+{
+  const uint32_t RESPONSE_DELAY_MS = 1000U;
+  uint32_t current_time_ms = millis();
+  
+  esp_8266_serial.println(ESP8266_SETUP_CONNECTION); // enable multiple connections
+
+  // delay RESPONSE_DELAY_MS milliseconds
+  while((millis() - current_time_ms) < RESPONSE_DELAY_MS);
+
+  // ensure we get back "OK"
+  if(esp_8266_serial.available())
+  {
+    String esp8266_response = esp_8266_serial.readString();
+    // make sure it returns OK
+    if(esp8266_response.indexOf("OK") == -1)
+    {
+      return false;
+    }
+    else
+    {
+      // continue
+    }
+  }
+  else
+  {
+    // no response, return false
+    return false; 
+  }
+
+  esp_8266_serial.println(ESP8266_SETUP_PORT); // Setup TCP server and set port
+
+  // delay RESPONSE_DELAY_MS milliseconds
+  while((millis() - current_time_ms) < RESPONSE_DELAY_MS);
+
+  if(esp_8266_serial.available())
+  {
+    String esp8266_response = esp_8266_serial.readString();
+    // make sure it returns OK
+    if(esp8266_response.indexOf("OK") == -1)
+    {
+      return false;
+    }
+    else
+    {
+      // continue
+    }
+  }
+  else
+  {
+    // no response, return false
+    return false; 
+  }
+  
+  return true;
+}
+
+/**
+ * @brief Turn on wifi
+ * @param on 
+ */
+static void flightLanding_private_turnOnWifi(bool on)
+{
+  if(on == true)
+  {
+    digitalWrite(PIN_ESP8266_CHIP_POWERDOWN, HIGH);
+  }
+  else
+  {
+    digitalWrite(PIN_ESP8266_CHIP_POWERDOWN, LOW);
+  }
+}
+
+
+
 /*****************************************
  *           PUBLIC FUNCTIONS            *
  *      ONLY CONTAINS SETUP & LOOP       *
@@ -196,7 +368,34 @@ static void flightLanding_private_setCurrentState(void)
  
 void setup() 
 {
-      // initialize flightLanding_data struct and state
+  bool tcp_server_running = false;
+  
+  // initialize flightLanding_data struct and state
+  flightLanding_data.present_state = STATE_WIFI_ON;
+  flightLanding_data.desired_state = STATE_WIFI_ON;
+
+  // turn on wifi
+  pinMode(PIN_ESP8266_CHIP_POWERDOWN, OUTPUT);// CH_PD
+  pinMode(PIN_ESP8266_RESET, OUTPUT);// RST
+  digitalWrite(PIN_ESP8266_RESET, HIGH);
+
+  flightLanding_private_turnOnWifi(true);
+
+  // Setup serial connection
+  esp_8266_serial.begin(ESP_8266_SERIAL_BAUD);
+  pc_serial.begin(PC_SERIAL_BAUD);
+
+  // Run setup commands for TCP server on startup
+  tcp_server_running = flightLanding_private_setupTCPServer();
+
+  if(tcp_server_running == false)
+  {
+    // log to error file
+    // try again here?
+    // maybe loop until its running or we reach a count
+  }
+    
+    // open log file
 }
 
 void loop() 
