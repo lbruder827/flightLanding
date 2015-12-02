@@ -16,6 +16,9 @@
  *                 DEFINES               *
  *****************************************/
 
+#define ECHO 1
+
+
 #define COLLECTION_RATE_MS    (uint8_t)100
 
 #define esp_8266_serial       Serial1
@@ -95,7 +98,7 @@ static const String LOG_FILE = "log.txt";
 static const String ESP8266_SETUP_CONNECTION = "AT+CIPMUX=1"; // allow multiple connections
 static const String ESP8266_SETUP_PORT = "AT+CIPSERVER=1,1336"; // setup TCP server on port 1336
 static const String ESP8266_ANYONE_CONNECTED = "AT+CWLIF";  // String to see if anyone is currently connected
-
+static const String ESP8266_SEND_STRING = "AT+CIPSEND=0,"; // String to send through wifi, %d is the number of bytes
 /*****************************************
  *           PRIVATE FUNCTIONS           *
  *****************************************/
@@ -250,17 +253,24 @@ static void flightLanding_private_setCurrentState(void)
 
       if(esp_8266_serial.available())
       {
-        String str = esp_8266_serial.readString();
-        pc_serial.println(str);
+        String send_str = esp_8266_serial.readString();
 
-        if(str.indexOf("COOL") != -1)
-        {
-            pc_serial.println("I SEE COOL");
-        }
-        else
-        {
-            pc_serial.println("NOT RECOGNIZED COMMAND");
-        }
+        // echo client
+#if ECHO
+        // Header containing string to send
+        String send_header = String(ESP8266_SEND_STRING) + String(send_str.length());
+        // Send the header and wait for the '>'
+        esp_8266_serial.println(send_header);
+        uint32_t currTime = millis();
+        while((millis() - currTime) < 1000U);
+        // send the string
+        esp_8266_serial.println(send_str);
+      
+        currTime = millis();
+        while((millis() - currTime) < 1000U);
+        // clear the buffer
+        (void)esp_8266_serial.readString();
+#endif
       }
 
       break;
