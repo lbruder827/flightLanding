@@ -94,6 +94,7 @@ static const String LOG_FILE = "log.txt";
 // Commands initially sent to wifi to setup TCP server
 static const String ESP8266_SETUP_CONNECTION = "AT+CIPMUX=1"; // allow multiple connections
 static const String ESP8266_SETUP_PORT = "AT+CIPSERVER=1,1336"; // setup TCP server on port 1336
+static const String ESP8266_ANYONE_CONNECTED = "AT+CWLIF";  // String to see if anyone is currently connected
 
 /*****************************************
  *           PRIVATE FUNCTIONS           *
@@ -228,20 +229,39 @@ static void flightLanding_private_getDesiredState(void)
  */
 static void flightLanding_private_setCurrentState(void)
 {
-  flightLanding_state_E desiredState = flightLanding_data.desired_state;
+  flightLanding_state_E currentState = flightLanding_data.desired_state;
 
-  switch(desiredState)
+  switch(currentState)
   {
     case STATE_WIFI_ON:
       if(flightLanding_data.state_transition == true)
       {
         // transition specific behavior
-        // turn on wifi
 
+        // Turn on wifi
+        flightLanding_private_turnOnWifi(true);
       }
 
-      // do general state behavior here
-      // have wifi file take care of this for different commands
+// Echo what is sent into console
+//      if(pc_serial.available())
+//      {
+//        esp_8266_serial.println(pc_serial.readString());
+//      }
+
+      if(esp_8266_serial.available())
+      {
+        String str = esp_8266_serial.readString();
+        pc_serial.println(str);
+
+        if(str.indexOf("COOL") != -1)
+        {
+            pc_serial.println("I SEE COOL");
+        }
+        else
+        {
+            pc_serial.println("NOT RECOGNIZED COMMAND");
+        }
+      }
 
       break;
 
@@ -251,7 +271,7 @@ static void flightLanding_private_setCurrentState(void)
         // transition specific behavior
         
         // turn off wifi
-        // turn on IMU
+        flightLanding_private_turnOnWifi(false);
       }
       
       // grab data every COLLECTION_RATE_MS
@@ -278,7 +298,7 @@ static void flightLanding_private_setCurrentState(void)
       break;
   }
 
-  flightLanding_data.desired_state = desiredState;
+  flightLanding_data.present_state = currentState;
 }
 
 /**
@@ -289,10 +309,14 @@ static void flightLanding_private_setCurrentState(void)
 static bool flightLanding_private_setupTCPServer(void)
 {
   const uint32_t RESPONSE_DELAY_MS = 1000U;
-  uint32_t current_time_ms = millis();
+  uint32_t current_time_ms;
+
+  // clear response
+  (void)esp_8266_serial.readString();
   
   esp_8266_serial.println(ESP8266_SETUP_CONNECTION); // enable multiple connections
-
+  current_time_ms = millis();
+  
   // delay RESPONSE_DELAY_MS milliseconds
   while((millis() - current_time_ms) < RESPONSE_DELAY_MS);
 
@@ -300,6 +324,9 @@ static bool flightLanding_private_setupTCPServer(void)
   if(esp_8266_serial.available())
   {
     String esp8266_response = esp_8266_serial.readString();
+    
+    pc_serial.println(esp8266_response);
+    
     // make sure it returns OK
     if(esp8266_response.indexOf("OK") == -1)
     {
@@ -317,13 +344,17 @@ static bool flightLanding_private_setupTCPServer(void)
   }
 
   esp_8266_serial.println(ESP8266_SETUP_PORT); // Setup TCP server and set port
-
+  current_time_ms = millis();
+  
   // delay RESPONSE_DELAY_MS milliseconds
   while((millis() - current_time_ms) < RESPONSE_DELAY_MS);
 
+  // Ensure we get back OK response
   if(esp_8266_serial.available())
   {
     String esp8266_response = esp_8266_serial.readString();
+    pc_serial.println(esp8266_response);
+
     // make sure it returns OK
     if(esp8266_response.indexOf("OK") == -1)
     {
@@ -379,6 +410,9 @@ void setup()
   pinMode(PIN_ESP8266_RESET, OUTPUT);// RST
   digitalWrite(PIN_ESP8266_RESET, HIGH);
 
+  // Give esp8266 time to turn on
+  delay(1000);
+
   flightLanding_private_turnOnWifi(true);
 
   // Setup serial connection
@@ -388,6 +422,8 @@ void setup()
   // Run setup commands for TCP server on startup
   tcp_server_running = flightLanding_private_setupTCPServer();
 
+  pc_serial.println(tcp_server_running);
+  
   if(tcp_server_running == false)
   {
     // log to error file
@@ -409,7 +445,7 @@ void loop()
   // state transition?
   flightLanding_data.state_transition = (flightLanding_data.desired_state != flightLanding_data.present_state) ? true : false;
 
+  // pc_serial.print("Current state: "); pc_serial.println(flightLanding_data.present_state);
   // set current state
   flightLanding_private_setCurrentState();
-  
 }
