@@ -27,9 +27,12 @@
 #define pc_serial             Serial
 #define PC_SERIAL_BAUD        9600
 
-#define PIN_ESP8266_CHIP_POWERDOWN  (uint8_t)2U
-#define PIN_ESP8266_RESET           (uint8_t)3U
+#define PIN_ESP8266_CHIP_POWERDOWN  2
+#define PIN_ESP8266_RESET           3
 
+#define PIN_LED_RED                     23
+#define PIN_LED_GREEN                   22
+#define PIN_LED_BLUE                    21
 /*****************************************
  *                 TYPEDEFS              *
  *****************************************/
@@ -431,8 +434,6 @@ void setup()
 
   // Run setup commands for TCP server on startup
   tcp_server_running = flightLanding_private_setupTCPServer();
-
-  pc_serial.println(tcp_server_running);
   
   if(tcp_server_running == false)
   {
@@ -440,8 +441,15 @@ void setup()
     // try again here?
     // maybe loop until its running or we reach a count
   }
-    
-    // open log file
+
+
+  pinMode(PIN_LED_RED, OUTPUT);
+  pinMode(PIN_LED_GREEN, OUTPUT);
+  pinMode(PIN_LED_BLUE, OUTPUT);
+
+  digitalWrite(PIN_LED_RED,  HIGH);
+  digitalWrite(PIN_LED_GREEN,  HIGH);
+  digitalWrite(PIN_LED_BLUE,  LOW);
 }
 
 void loop() 
