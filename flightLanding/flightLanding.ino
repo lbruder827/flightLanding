@@ -1,3 +1,4 @@
+
 /**
  * Author: Lucas Bruder
  * Filename: flightLanding.ino
@@ -11,6 +12,9 @@
 /*****************************************
  *                 INCLUDES              *
  *****************************************/
+ 
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
 
 /*****************************************
  *                 DEFINES               *
@@ -18,8 +22,8 @@
 
 #define ECHO 1
 
-
-#define COLLECTION_RATE_MS    (uint8_t)100
+#define COLLECTION_RATE_MS         (100)
+#define BNO055_SAMPLERATE_DELAY_MS (100)
 
 #define esp_8266_serial       Serial1
 #define ESP_8266_SERIAL_BAUD  115200
@@ -33,10 +37,17 @@
 #define PIN_LED_RED                     23
 #define PIN_LED_GREEN                   22
 #define PIN_LED_BLUE                    21
+
+#define IMU_MAX_CALIBRATION_VALUE       3
 /*****************************************
  *                 TYPEDEFS              *
  *****************************************/
- 
+
+typedef enum{
+  LED_RED,
+  LED_GREEN,
+  LED_BLUE,  
+ } led_pins_E;
 /**
  * State enumerations
  */
@@ -66,7 +77,21 @@ typedef struct{
 
   // Last time we measured data
   uint32_t last_time_collected_ms;
+
+  bool all_sensors_calibrated;
 } flightLanding_data_S;
+
+/**
+ * Struct containing fade amounts and brightnesses for all LEDs
+ */
+typedef struct{
+  int red_led_brightness;
+  int red_led_fade_amount;
+  int green_led_brightness;
+  int green_led_fade_amount;
+  int blue_led_brightness;
+  int blue_led_fade_amount;
+} led_information_S;
 
 
 /*****************************************
@@ -86,6 +111,7 @@ static bool flightLanding_private_allowTransitionDebugToWifiOn(void);
 
 static bool flightLanding_private_setupTCPServer(void);
 static void flightLanding_private_turnOnWifi(bool on);
+static void flightLanding_private_fadeLED(led_pins_E ledPin);
 
 /*****************************************
  *             STATIC VARIABLES          *
@@ -93,6 +119,8 @@ static void flightLanding_private_turnOnWifi(bool on);
 
 // State machine and other related information
 static flightLanding_data_S flightLanding_data;
+static led_information_S led_information;
+Adafruit_BNO055 bno = Adafruit_BNO055();
 
 // Log file
 static const String LOG_FILE = "log.txt";
@@ -145,9 +173,12 @@ static bool flightLanding_private_allowTransitionWifiOnToRecording(void)
   bool allowTransition = false;
 
   // make a new file on the SD card if transition is allowed
-  // make sure the acceleration and gyroscopic data is calibrated before allowing transition
-  // need a way to make this evident to the user
-  // https://learn.adafruit.com/adafruit-bno055-absolute-orientation-sensor/device-calibration
+  // check for button press and flightLanding_data.all_sensors_calibrated
+
+//  if(flightLanding_data.all_sensors_calibrated == true && buttonpressed)
+//  {
+//    allowTransition = true;
+//  }
 
   return allowTransition;
 }
@@ -276,6 +307,37 @@ static void flightLanding_private_setCurrentState(void)
 #endif
       }
 
+      /*
+       * Grab calibration values. If not calibrated, continue to blink green.
+       */
+      if(flightLanding_data.all_sensors_calibrated == false)
+      {
+        uint8_t system, gyro, accel, mag = 0;
+        bno.getCalibration(&system, &gyro, &accel, &mag);
+        Serial.print("CALIBRATION: Sys=");
+        Serial.print(system, DEC);
+        Serial.print(" Gyro=");
+        Serial.print(gyro, DEC);
+        Serial.print(" Accel=");
+        Serial.print(accel, DEC);
+        Serial.print(" Mag=");
+        Serial.println(mag, DEC);
+        if((gyro == IMU_MAX_CALIBRATION_VALUE)  &&
+           (accel == IMU_MAX_CALIBRATION_VALUE) && 
+           (mag == IMU_MAX_CALIBRATION_VALUE))
+        {
+          flightLanding_data.all_sensors_calibrated = true;
+          digitalWrite(PIN_LED_GREEN, LOW);
+          digitalWrite(PIN_LED_RED, HIGH);
+          digitalWrite(PIN_LED_BLUE, HIGH);
+        }
+        else
+        {
+          flightLanding_private_fadeLED(LED_GREEN);
+        }
+      }
+      
+
       break;
 
     case STATE_RECORDING:
@@ -314,6 +376,66 @@ static void flightLanding_private_setCurrentState(void)
   flightLanding_data.present_state = currentState;
 }
 
+static void flightLanding_private_fadeLED(led_pins_E ledPin)
+{
+    uint32_t led_time_ms;
+
+    if(ledPin == LED_GREEN)
+    {
+      int brightness = led_information.green_led_brightness;
+      int fadeamount = led_information.green_led_fade_amount;
+      
+      analogWrite(PIN_LED_GREEN, brightness);
+      brightness += fadeamount;
+      
+      if(brightness == 0 || brightness == 255)
+      {
+        fadeamount = -fadeamount;
+      }
+  
+      led_information.green_led_brightness = brightness;
+      led_information.green_led_fade_amount = fadeamount;
+      led_time_ms = millis();
+      while((millis() - led_time_ms) < 5);
+    }
+    else if(ledPin == LED_BLUE)
+    {
+      int brightness = led_information.blue_led_brightness;
+      int fadeamount = led_information.blue_led_fade_amount;
+      
+      analogWrite(PIN_LED_BLUE, brightness);
+      brightness += fadeamount;
+      
+      if(brightness == 0 || brightness == 255)
+      {
+        fadeamount = -fadeamount;
+      }
+  
+      led_information.blue_led_brightness = brightness;
+      led_information.blue_led_fade_amount = fadeamount;
+      led_time_ms = millis();
+      while((millis() - led_time_ms) < 5);
+    }
+    else if(ledPin == LED_RED)
+    {
+      int brightness = led_information.red_led_brightness;
+      int fadeamount = led_information.red_led_fade_amount;
+      
+      analogWrite(PIN_LED_RED, brightness);
+      brightness += fadeamount;
+      
+      if(brightness == 0 || brightness == 255)
+      {
+        fadeamount = -fadeamount;
+      }
+  
+      led_information.red_led_brightness = brightness;
+      led_information.red_led_fade_amount = fadeamount;
+      led_time_ms = millis();
+      while((millis() - led_time_ms) < 5);
+    }
+}
+
 /**
  * @brief run the AT commands required to setup the TCP server on the device.
  * 
@@ -321,7 +443,7 @@ static void flightLanding_private_setCurrentState(void)
  */
 static bool flightLanding_private_setupTCPServer(void)
 {
-  const uint32_t RESPONSE_DELAY_MS = 1000U;
+  const uint32_t RESPONSE_DELAY_MS = 500U;
   uint32_t current_time_ms;
 
   // clear response
@@ -329,15 +451,20 @@ static bool flightLanding_private_setupTCPServer(void)
   
   esp_8266_serial.println(ESP8266_SETUP_CONNECTION); // enable multiple connections
   current_time_ms = millis();
-  
-  // delay RESPONSE_DELAY_MS milliseconds
-  while((millis() - current_time_ms) < RESPONSE_DELAY_MS);
+
+  /* 
+   * Delay and do some fancy LED dimming
+   */
+  while((millis() - current_time_ms) < RESPONSE_DELAY_MS)
+  {
+    flightLanding_private_fadeLED(LED_GREEN);
+  }
 
   // ensure we get back "OK"
   if(esp_8266_serial.available())
   {
     String esp8266_response = esp_8266_serial.readString();
-    
+
     pc_serial.println(esp8266_response);
     
     // make sure it returns OK
@@ -359,14 +486,21 @@ static bool flightLanding_private_setupTCPServer(void)
   esp_8266_serial.println(ESP8266_SETUP_PORT); // Setup TCP server and set port
   current_time_ms = millis();
   
-  // delay RESPONSE_DELAY_MS milliseconds
-  while((millis() - current_time_ms) < RESPONSE_DELAY_MS);
+  /* 
+   * Delay and do some fancy LED dimming
+   */
+  while((millis() - current_time_ms) < RESPONSE_DELAY_MS)
+  {
+    flightLanding_private_fadeLED(LED_GREEN);
+  }
 
   // Ensure we get back OK response
   if(esp_8266_serial.available())
   {
     String esp8266_response = esp_8266_serial.readString();
+
     pc_serial.println(esp8266_response);
+
 
     // make sure it returns OK
     if(esp8266_response.indexOf("OK") == -1)
@@ -414,23 +548,50 @@ void setup()
 {
   bool tcp_server_running = false;
   
-  // initialize flightLanding_data struct and state
+  /*
+   * INITILIZE DATA STRUCT
+   */
   flightLanding_data.present_state = STATE_WIFI_ON;
   flightLanding_data.desired_state = STATE_WIFI_ON;
+  flightLanding_data.all_sensors_calibrated = false;
 
-  // turn on wifi
-  pinMode(PIN_ESP8266_CHIP_POWERDOWN, OUTPUT);// CH_PD
-  pinMode(PIN_ESP8266_RESET, OUTPUT);// RST
-  digitalWrite(PIN_ESP8266_RESET, HIGH);
-
-  // Give esp8266 time to turn on
-  delay(1000);
-
-  flightLanding_private_turnOnWifi(true);
-
-  // Setup serial connection
+  /*
+   * INITIALIZE LED STRUCT
+   */
+   led_information.red_led_brightness = 0;
+   led_information.red_led_fade_amount = 0;
+   led_information.green_led_brightness = 0;
+   led_information.green_led_fade_amount = 5;
+   led_information.blue_led_brightness = 0;
+   led_information.blue_led_fade_amount = 0;
+  /*
+   * SETUP SERIAL PORTS
+   */
   esp_8266_serial.begin(ESP_8266_SERIAL_BAUD);
   pc_serial.begin(PC_SERIAL_BAUD);
+
+  /*
+   * PIN CONFIGURATION
+   */
+  pinMode(PIN_ESP8266_CHIP_POWERDOWN, OUTPUT); // CH_PD
+  pinMode(PIN_ESP8266_RESET,          OUTPUT); // RST
+  pinMode(PIN_LED_RED,                OUTPUT);
+  pinMode(PIN_LED_GREEN,              OUTPUT);
+  pinMode(PIN_LED_BLUE,               OUTPUT);
+
+  /*
+   * INITIALIZE PIN STATES
+   */
+  digitalWrite(PIN_LED_RED,       HIGH);
+  digitalWrite(PIN_LED_GREEN,     LOW);
+  digitalWrite(PIN_LED_BLUE,      HIGH);
+  digitalWrite(PIN_ESP8266_RESET, HIGH);
+
+  /*
+   * TURN ON WIFI
+   */
+  flightLanding_private_turnOnWifi(true);
+  delay(500);
 
   // Run setup commands for TCP server on startup
   tcp_server_running = flightLanding_private_setupTCPServer();
@@ -440,16 +601,26 @@ void setup()
     // log to error file
     // try again here?
     // maybe loop until its running or we reach a count
+    digitalWrite(PIN_LED_RED,       LOW);
+    digitalWrite(PIN_LED_GREEN,     HIGH);
+    digitalWrite(PIN_LED_BLUE,      HIGH);
+    pc_serial.println("error");
   }
 
+  /*
+   * SETUP IMU
+   */
+   if(!bno.begin())
+   {
+    // log to error here
+    digitalWrite(PIN_LED_RED,       LOW);
+    digitalWrite(PIN_LED_GREEN,     HIGH);
+    digitalWrite(PIN_LED_BLUE,      HIGH);
+    pc_serial.println("error");
+   }
 
-  pinMode(PIN_LED_RED, OUTPUT);
-  pinMode(PIN_LED_GREEN, OUTPUT);
-  pinMode(PIN_LED_BLUE, OUTPUT);
-
-  digitalWrite(PIN_LED_RED,  HIGH);
-  digitalWrite(PIN_LED_GREEN,  HIGH);
-  digitalWrite(PIN_LED_BLUE,  LOW);
+   delay(1000);
+   bno.setExtCrystalUse(true);
 }
 
 void loop() 
