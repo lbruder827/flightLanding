@@ -18,15 +18,14 @@
 #include <SFE_BMP180.h>
 #include <SPI.h>
 #include <SD.h>
-
+#include <EEPROM.h>
 /*****************************************
  *                 DEFINES               *
  *****************************************/
 
 #define ECHO 1
 
-#define COLLECTION_RATE_MS         (100)
-#define BNO055_SAMPLERATE_DELAY_MS (100)
+#define COLLECTION_RATE_MS         (200)
 
 #define esp_8266_serial       Serial1
 #define ESP_8266_SERIAL_BAUD  115200
@@ -39,13 +38,16 @@
 
 #define PIN_BNO055_CHIP_SELECT      10
 
-#define PIN_LED_RED                     23
-#define PIN_LED_GREEN                   22
-#define PIN_LED_BLUE                    21
+#define PIN_LED_RED                     17
+#define PIN_LED_GREEN                   15
+#define PIN_LED_BLUE                    16
+
+#define PIN_RECORDING_BUTTON                 21
+#define PIN_RECORDING_BUTTON_LED             23
 
 #define IMU_MAX_CALIBRATION_VALUE       3
 
-#define SD_CARD_MAX_FILES             255
+#define EEPROM_ADDR_FILE_NUM            0
 #define DATA_FILE_NUM_DECIMALS          4
 
 /*****************************************
@@ -98,6 +100,13 @@ typedef struct{
 
   File data_file;
   bool data_file_open;
+  byte file_num;
+
+  bool ready_to_record;
+  bool blue_button_pressed;
+  bool was_blue_button_pressed;
+  uint32_t time_blue_button_pressed_ms;
+  uint32_t time_blue_button_released_ms;
 } flightLanding_data_S;
 
 /**
@@ -130,6 +139,9 @@ static bool flightLanding_private_setupTCPServer(void);
 static void flightLanding_private_turnOnWifi(bool on);
 static void flightLanding_private_fadeLED(led_pins_E ledPin);
 static double getPressure(void);
+static bool flightLanding_private_sendMessage(String msg);
+static void flightLanding_private_sendFileNames();
+
 
 /*****************************************
  *             STATIC VARIABLES          *
@@ -146,19 +158,20 @@ SFE_BMP180 pressure;
 // SD Card
 static Sd2Card card;
 
-// Log file
-static const String LOG_FILE = "log.txt";
-static File log_file;
-
 /*
- * ESP8266 commands
+ * ESP8266 sending commands
  */
 static const String ESP8266_SETUP_CONNECTION = "AT+CIPMUX=1"; // allow multiple connections
 static const String ESP8266_SETUP_PORT = "AT+CIPSERVER=1,1336"; // setup TCP server on port 1336
 static const String ESP8266_ANYONE_CONNECTED = "AT+CWLIF";  // String to see if anyone is currently connected
 static const String ESP8266_SEND_STRING = "AT+CIPSEND=0,"; // String to send through wifi
+static const String ESP8266_COMMAND_DONE = "DONE";
+/**
+ * ESP8266 Receiving commands
+ */
+static const String ESP8266_GET_FILES_COMMAND = "GET_FILES";
 
-static const String LOG_FILE_EXTENSION = ".csv";
+static const String LOG_FILE_EXTENSION = ".CSV";
 static const String CSV_COLUMN_NAMES = "Time(ms),Altitude(m),Euler_X(deg),Euler_Y(deg),Euler_Z(deg),LinearAccel_X(m/s^2),LinearAccel_Y(m/s^2),LinearAccel_Z(m/s^2),Gyroscopic_X(rad/s),Gyroscopic_Y(rad/s),Gyroscopic_Z(rad/s),Accelerometer_X(m/s^2),Accelerometer_Y(m/s^2),Accelerometer_Z(m/s^2),Gravity_vector_X(m/s^2),Gravity_vector_Y(m/s^2),Gravity_vector_Z(m/s^2)\n";
 
 /*****************************************
@@ -181,14 +194,13 @@ static bool flightLanding_private_allowTransitionWifiOnToRecording(void)
 {
   bool allowTransition = false;
 
-  // make a new file on the SD card if transition is allowed
-  // check for button press and flightLanding_data.all_sensors_calibrated
-
-//  if(flightLanding_data.imu_ok == true && 
-//     flightLanding_data.all_sensors_calibrated == true && buttonpressed)
-//  {
-//    allowTransition = true;
-//  }
+  if(flightLanding_data.ready_to_record == true && 
+   ((millis() - flightLanding_data.time_blue_button_pressed_ms) > 1000U) && 
+   (flightLanding_data.blue_button_pressed == true))
+  {
+    allowTransition = true;
+    pc_serial.println("WIFI ON -> RECORDING");
+  }
 
   return allowTransition;
 }
@@ -203,7 +215,13 @@ static bool flightLanding_private_allowTransitionRecordingToWifiOn(void)
 {
   bool allowTransition = false;
 
-  // if transition is allowed to turn on wifi, close the file on the SD card
+  if(((millis() - flightLanding_data.time_blue_button_released_ms) > 1000U) && 
+      (flightLanding_data.blue_button_pressed == false))
+  {
+    allowTransition = true;
+    pc_serial.println("RECORDING -> WIFI ON");
+
+  }
 
   return allowTransition;
 }
@@ -217,7 +235,36 @@ static bool flightLanding_private_allowTransitionRecordingToWifiOn(void)
  */
 static void flightLanding_private_processData(void)
 {
-  // grab button presses
+    flightLanding_data.blue_button_pressed = digitalRead(PIN_RECORDING_BUTTON) ^ 1;
+
+    //pc_serial.printf("Button: %d\n", flightLanding_data.blue_button_pressed);
+    /*
+     * POSITIVE EDGE OF BLUE BUTTON
+     */
+    if((flightLanding_data.was_blue_button_pressed == false) && 
+       (flightLanding_data.blue_button_pressed == true))
+    {
+      flightLanding_data.time_blue_button_pressed_ms = millis();
+      pc_serial.println("Pressed");
+    }
+    /*
+     * NEGATIVE EDGE OF BLUE BUTTON PRESS
+     */
+    else if((flightLanding_data.was_blue_button_pressed == true) && 
+            (flightLanding_data.blue_button_pressed == false))
+    {
+      flightLanding_data.time_blue_button_released_ms = millis();
+      pc_serial.println("Released");
+    }
+
+    /*
+     * The module is ready to record if every sensor is OK and calibrated
+     */
+    flightLanding_data.ready_to_record = flightLanding_data.imu_ok &
+                                         flightLanding_data.pressure_ok &
+                                         flightLanding_data.sd_ok & 
+                                         flightLanding_data.all_sensors_calibrated;
+
 }
 
 /**
@@ -275,13 +322,18 @@ static void flightLanding_private_setCurrentState(void)
       {
         // Turn on wifi
         flightLanding_private_turnOnWifi(true);
+        digitalWrite(PIN_RECORDING_BUTTON_LED, LOW);
 
         if(flightLanding_data.data_file_open == true)
         {
-          flightLanding_data.data_file.flush();
           flightLanding_data.data_file.close();
           flightLanding_data.data_file_open = false;
+          EEPROM.write(EEPROM_ADDR_FILE_NUM, flightLanding_data.file_num+1);
         }
+
+        digitalWrite(PIN_LED_RED, HIGH);
+        digitalWrite(PIN_LED_GREEN, HIGH);
+        digitalWrite(PIN_LED_BLUE, HIGH);
       }
       
       /*
@@ -293,22 +345,43 @@ static void flightLanding_private_setCurrentState(void)
       {
         uint8_t system, gyro, accel, mag = 0;
         bno.getCalibration(&system, &gyro, &accel, &mag);
+        
+//        Serial.print("CALIBRATION: Sys=");
+//        Serial.print(system, DEC);
+//        Serial.print(" Gyro=");
+//        Serial.print(gyro, DEC);
+//        Serial.print(" Accel=");
+//        Serial.print(accel, DEC);
+//        Serial.print(" Mag=");
+//        Serial.println(mag, DEC);
+  
         if((gyro == IMU_MAX_CALIBRATION_VALUE)  &&
            (accel == IMU_MAX_CALIBRATION_VALUE) && 
            (mag == IMU_MAX_CALIBRATION_VALUE))
         {
           flightLanding_data.all_sensors_calibrated = true;
-          analogWrite(PIN_LED_GREEN, 0);
-          analogWrite(PIN_LED_RED, 255);
-          analogWrite(PIN_LED_BLUE, 255);
+          pc_serial.println("Calibrated");
         }
         else
         {
           flightLanding_private_fadeLED(LED_GREEN);
         }
       }
+      else
+      {
+        digitalWrite(PIN_LED_GREEN, LOW);
+      }
 
-      // process esp8266 serial
+      // process esp8266 commands
+      if(esp_8266_serial.available())
+      {
+        String command_string = esp_8266_serial.readString();
+        pc_serial.print("ESP8266 received: "); pc_serial.println(command_string);
+        if(command_string.indexOf(ESP8266_GET_FILES_COMMAND) != -1)
+        {
+           flightLanding_private_sendFileNames();
+        }
+      }
 
       break;
 
@@ -319,28 +392,35 @@ static void flightLanding_private_setCurrentState(void)
          * Turn on wifi and grab the baseline pressure
          */
         flightLanding_private_turnOnWifi(false);
+        digitalWrite(PIN_RECORDING_BUTTON_LED, HIGH);
         delay(100);
+
+        pc_serial.println("Getting baseline pressure");
+        
         flightLanding_data.baseline_pressure = getPressure();
 
-        String file_name;
-        /*
-         * Find a name for the file that doesn't yet exist and open it.
-         */
-         for(int32_t index = 0; index < SD_CARD_MAX_FILES; index++)
-         {
-            String file = String(index + LOG_FILE_EXTENSION);
-            if(SD.exists(file))
-            {
-              file_name = file;
-            }
-            else
-            {
-              // continue searching
-            }
-         }
-         
-         flightLanding_data.data_file = SD.open(file_name);
-         flightLanding_data.data_file_open = true;
+        pc_serial.println("Finding file name");
+
+        flightLanding_data.file_num = EEPROM.read(EEPROM_ADDR_FILE_NUM);
+        String file_name = String(flightLanding_data.file_num + LOG_FILE_EXTENSION);
+        pc_serial.print("Filename: "); pc_serial.println(file_name);
+        flightLanding_data.data_file = SD.open(file_name, FILE_WRITE);
+        
+        if(!flightLanding_data.data_file)
+        {
+          pc_serial.println("Error opening file");
+        }
+        else
+        {
+          flightLanding_data.data_file_open = true;
+          pc_serial.println("File opened successfully");
+        }
+
+        flightLanding_data.data_file.println(CSV_COLUMN_NAMES);
+
+        digitalWrite(PIN_LED_RED, LOW);
+        digitalWrite(PIN_LED_GREEN, HIGH);
+        digitalWrite(PIN_LED_BLUE, HIGH);
       }
       
       // grab data every COLLECTION_RATE_MS
@@ -352,6 +432,8 @@ static void flightLanding_private_setCurrentState(void)
          * Write the data to the SD card
          */
         uint32_t currentTime_ms = millis();
+        flightLanding_data.last_time_collected_ms = currentTime_ms;
+        
         data_file.print(currentTime_ms); data_file.print(",");
 
         // Altitude in meters
@@ -360,36 +442,35 @@ static void flightLanding_private_setCurrentState(void)
 
         // Euler X,Y,Z in degrees
         imu::Vector<3> euler = bno.getVector(Adafruit_BNO055::VECTOR_EULER);
-        data_file.print(euler.x(),DATA_FILE_NUM_DECIMALS); data_file.println(",");
-        data_file.print(euler.y(),DATA_FILE_NUM_DECIMALS); data_file.println(",");
-        data_file.print(euler.z(),DATA_FILE_NUM_DECIMALS); data_file.println(",");
+        data_file.print(euler.x(),DATA_FILE_NUM_DECIMALS); data_file.print(",");
+        data_file.print(euler.y(),DATA_FILE_NUM_DECIMALS); data_file.print(",");
+        data_file.print(euler.z(),DATA_FILE_NUM_DECIMALS); data_file.print(",");
 
         // Linear Acceleration X,Y,Z in m/s^2
         imu::Vector<3> linear_accel = bno.getVector(Adafruit_BNO055::VECTOR_LINEARACCEL);
-        data_file.print(linear_accel.x(),DATA_FILE_NUM_DECIMALS); data_file.println(",");
-        data_file.print(linear_accel.y(),DATA_FILE_NUM_DECIMALS); data_file.println(",");
-        data_file.print(linear_accel.z(),DATA_FILE_NUM_DECIMALS); data_file.println(",");
+        data_file.print(linear_accel.x(),DATA_FILE_NUM_DECIMALS); data_file.print(",");
+        data_file.print(linear_accel.y(),DATA_FILE_NUM_DECIMALS); data_file.print(",");
+        data_file.print(linear_accel.z(),DATA_FILE_NUM_DECIMALS); data_file.print(",");
 
         // Gyroscopic X,Y,Z in rad/s
         imu::Vector<3> gyroscopic = bno.getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);
-        data_file.print(gyroscopic.x(),DATA_FILE_NUM_DECIMALS); data_file.println(",");
-        data_file.print(gyroscopic.y(),DATA_FILE_NUM_DECIMALS); data_file.println(",");
-        data_file.print(gyroscopic.z(),DATA_FILE_NUM_DECIMALS); data_file.println(",");
+        data_file.print(gyroscopic.x(),DATA_FILE_NUM_DECIMALS); data_file.print(",");
+        data_file.print(gyroscopic.y(),DATA_FILE_NUM_DECIMALS); data_file.print(",");
+        data_file.print(gyroscopic.z(),DATA_FILE_NUM_DECIMALS); data_file.print(",");
         
         // Accelerometer X,Y,Z in m/s^2
         imu::Vector<3> accelerometer = bno.getVector(Adafruit_BNO055::VECTOR_ACCELEROMETER);
-        data_file.print(accelerometer.x(),DATA_FILE_NUM_DECIMALS); data_file.println(",");
-        data_file.print(accelerometer.y(),DATA_FILE_NUM_DECIMALS); data_file.println(",");
-        data_file.print(accelerometer.z(),DATA_FILE_NUM_DECIMALS); data_file.println(",");
+        data_file.print(accelerometer.x(),DATA_FILE_NUM_DECIMALS); data_file.print(",");
+        data_file.print(accelerometer.y(),DATA_FILE_NUM_DECIMALS); data_file.print(",");
+        data_file.print(accelerometer.z(),DATA_FILE_NUM_DECIMALS); data_file.print(",");
 
         // Gravity vector X,Y,Z in m/s^2
         imu::Vector<3> gravity = bno.getVector(Adafruit_BNO055::VECTOR_GRAVITY);
-        data_file.print(gravity.x(),DATA_FILE_NUM_DECIMALS); data_file.println(",");
-        data_file.print(gravity.y(),DATA_FILE_NUM_DECIMALS); data_file.println(",");
-        data_file.print(gravity.z(),DATA_FILE_NUM_DECIMALS); data_file.println(",");
+        data_file.print(gravity.x(),DATA_FILE_NUM_DECIMALS); data_file.print(",");
+        data_file.print(gravity.y(),DATA_FILE_NUM_DECIMALS); data_file.print(",");
+        data_file.print(gravity.z(),DATA_FILE_NUM_DECIMALS); data_file.print(",");
 
         data_file.print("\n");
-        flightLanding_data.last_time_collected_ms = millis();
       }
       break;
 
@@ -405,6 +486,38 @@ static void flightLanding_private_setCurrentState(void)
 /*****************************************
  *            HELPER FUNCTIONS           *
  *****************************************/
+
+/**
+ * @brief Send the .CSV file names through wifi
+ */
+static void flightLanding_private_sendFileNames()
+{
+  File dir = SD.open("/");
+  
+  while(1)
+  {
+     File entry =  dir.openNextFile();
+     if(!entry)
+     {
+       break;
+     }
+
+     String file_name = entry.name();
+     /*
+      * Only print .csv files
+      */
+     if(file_name.indexOf(LOG_FILE_EXTENSION) != -1)
+     {
+        flightLanding_private_sendMessage(file_name);
+     }
+     
+     entry.close();
+  }
+
+  flightLanding_private_sendMessage(ESP8266_COMMAND_DONE);
+
+  pc_serial.println("Done listing file names");
+}
 
 /**
  * @brief fade an led
@@ -550,6 +663,64 @@ static bool flightLanding_private_setupTCPServer(void)
 }
 
 /**
+ * Send message through wifi
+ */
+static bool flightLanding_private_sendMessage(String msg)
+{
+  String send_header = String(ESP8266_SEND_STRING) + String(msg.length());
+
+  // Send the header with the number of bytes to be sent
+  esp_8266_serial.println(send_header);
+  pc_serial.println(send_header);
+  uint32_t currTime = millis();
+
+  /**
+   * Either wait a second or until data is available to be read
+   */
+  while((!esp_8266_serial.available()) || 
+       ((millis() - currTime) < 200U))
+  {
+    
+  }
+
+  String response = esp_8266_serial.readString();
+
+  // make sure the '>' is in the response
+  if(!response.indexOf('>') != -1)
+  {
+    // continue
+  }
+  else
+  {
+    return false;
+  }
+
+  // Send the data
+  esp_8266_serial.println(msg);
+  currTime = millis();
+
+
+  // Wait for 'OK'
+  while((!esp_8266_serial.available()) || 
+       ((millis() - currTime) < 200U))
+  {
+    
+  }
+
+  if(!esp_8266_serial.readString().indexOf('OK') != -1)
+  {
+    // continue
+  }
+  // ERROR
+  else
+  {
+    return false;
+  }
+
+  return true;  
+}
+
+/**
  * @brief Turn on wifi
  * @param on 
  */
@@ -647,7 +818,6 @@ void setup()
    */
   esp_8266_serial.begin(ESP_8266_SERIAL_BAUD);
   pc_serial.begin(PC_SERIAL_BAUD);
-
   delay(2000);
   
   pc_serial.println("---Initializing Flight Landing System---\n");
@@ -678,14 +848,18 @@ void setup()
   pinMode(PIN_LED_RED,                OUTPUT);
   pinMode(PIN_LED_GREEN,              OUTPUT);
   pinMode(PIN_LED_BLUE,               OUTPUT);
+  pinMode(PIN_RECORDING_BUTTON,        INPUT);
+  pinMode(PIN_RECORDING_BUTTON_LED,   OUTPUT);
 
   /*
    * INITIALIZE PIN STATES
    */
-  digitalWrite(PIN_LED_RED,       HIGH);
-  digitalWrite(PIN_LED_GREEN,     LOW);
-  digitalWrite(PIN_LED_BLUE,      HIGH);
-  digitalWrite(PIN_ESP8266_RESET, HIGH);
+  digitalWrite(PIN_LED_RED,        HIGH);
+  digitalWrite(PIN_LED_GREEN,       LOW);
+  digitalWrite(PIN_LED_BLUE,       HIGH);
+  digitalWrite(PIN_ESP8266_RESET,  HIGH);
+  digitalWrite(PIN_RECORDING_BUTTON_LED, LOW);
+
 
   pc_serial.println("Turning on wifi, IMU, SD, and pressure sensor");
   pc_serial.println("Wifi server setup on port 1336, IP address 192.168.4.1\n");
@@ -696,44 +870,37 @@ void setup()
   flightLanding_private_turnOnWifi(true);
   delay(500);
 
+  pc_serial.println("--- Initialization Status ---");
+
   /*
    * Setup wifi, IMU, pressure sensor, and SD card
    */
   flightLanding_data.wifi_ok = flightLanding_private_setupTCPServer();  
-  flightLanding_data.imu_ok = bno.begin();
+  pc_serial.print("WIFI: ");            pc_serial.println(flightLanding_data.wifi_ok ?     "OK" : "ERROR");
   flightLanding_data.pressure_ok = pressure.begin();
+  pc_serial.print("Pressure Sensor: "); pc_serial.println(flightLanding_data.pressure_ok ? "OK" : "ERROR");
   flightLanding_data.sd_ok = SD.begin(PIN_BNO055_CHIP_SELECT);
+  pc_serial.print("SD Card Reader: ");  pc_serial.println(flightLanding_data.sd_ok ?       "OK" : "ERROR");
+  flightLanding_data.imu_ok = bno.begin();
+  pc_serial.print("IMU: ");             pc_serial.println(flightLanding_data.imu_ok ?      "OK" : "ERROR");
+  
 
   // Give everything time to turn on
   delay(500);
 
   bno.setExtCrystalUse(true);
 
-  pc_serial.println("--- Initialization Status ---");
-  pc_serial.print("WIFI: ");            pc_serial.println(flightLanding_data.wifi_ok ?     "OK" : "ERROR");
-  pc_serial.print("IMU: ");             pc_serial.println(flightLanding_data.imu_ok ?      "OK" : "ERROR");
-  pc_serial.print("Pressure Sensor: "); pc_serial.println(flightLanding_data.pressure_ok ? "OK" : "ERROR");
-  pc_serial.print("SD Card Reader: ");  pc_serial.println(flightLanding_data.sd_ok ?       "OK" : "ERROR");
-
-  pc_serial.println("");
-
-  pc_serial.println("--- Opening log file --- ");
-  
-  log_file = SD.open("log.txt", FILE_WRITE);
-
-  if(log_file)
+  if(flightLanding_data.sd_ok == false)
   {
-    pc_serial.println("Succesfully opened log file");
+    while(!SD.begin(PIN_BNO055_CHIP_SELECT))
+    {
+      // spin waiting for connection
+      // fade some LEDs or shit
+    }
+
+    flightLanding_data.sd_ok = true;
+    pc_serial.println("SD Card Reader detects SD Card!");
   }
-  else
-  {
-    pc_serial.println("Error opening log file");
-  }
-
-  pc_serial.println("Data to be collected\n");
-
-  pc_serial.println(CSV_COLUMN_NAMES);
-
 }
 
 void loop() 
@@ -747,9 +914,10 @@ void loop()
   // state transition?
   flightLanding_data.state_transition = (flightLanding_data.desired_state != flightLanding_data.present_state) ? true : false;
 
-  // pc_serial.print("Current state: "); pc_serial.println(flightLanding_data.present_state);
   // set current state
   flightLanding_private_setCurrentState();
+
+  flightLanding_data.was_blue_button_pressed = flightLanding_data.blue_button_pressed;
 }
 
 /**
