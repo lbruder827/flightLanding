@@ -42,14 +42,16 @@
 #define PIN_LED_GREEN                   15
 #define PIN_LED_BLUE                    16
 
-#define PIN_RECORDING_BUTTON                 21
-#define PIN_RECORDING_BUTTON_LED             23
+#define PIN_RECORDING_BUTTON                 23
+#define PIN_RECORDING_BUTTON_LED             22
 
 #define IMU_MAX_CALIBRATION_VALUE       3
 
 #define EEPROM_ADDR_FILE_NUM            0
 #define DATA_FILE_NUM_DECIMALS          4
 
+#define NUM_BUTTON_READINGS             10
+#define BUTTON_PRESSED_CUTOFF_AVG        5
 /*****************************************
  *                 TYPEDEFS              *
  *****************************************/
@@ -105,8 +107,12 @@ typedef struct{
   bool ready_to_record;
   bool blue_button_pressed;
   bool was_blue_button_pressed;
-  uint32_t time_blue_button_pressed_ms;
-  uint32_t time_blue_button_released_ms;
+  uint32_t time_blue_button_pressed;
+  bool blue_button_double_tapped;
+  int blue_button_readings_count;
+  int blue_button_reading_sum;
+
+  uint32_t time_state_transition;
 } flightLanding_data_S;
 
 /**
@@ -166,6 +172,7 @@ static const String ESP8266_SETUP_PORT = "AT+CIPSERVER=1,1336"; // setup TCP ser
 static const String ESP8266_ANYONE_CONNECTED = "AT+CWLIF";  // String to see if anyone is currently connected
 static const String ESP8266_SEND_STRING = "AT+CIPSEND=0,"; // String to send through wifi
 static const String ESP8266_COMMAND_DONE = "DONE";
+static const String ESP8266_COMMAND_DOWNLOAD = "DOWNLOAD~";
 /**
  * ESP8266 Receiving commands
  */
@@ -194,12 +201,11 @@ static bool flightLanding_private_allowTransitionWifiOnToRecording(void)
 {
   bool allowTransition = false;
 
-  if(flightLanding_data.ready_to_record == true && 
-   ((millis() - flightLanding_data.time_blue_button_pressed_ms) > 1000U) && 
-   (flightLanding_data.blue_button_pressed == true))
+  if(flightLanding_data.blue_button_double_tapped == true)
   {
     allowTransition = true;
     pc_serial.println("WIFI ON -> RECORDING");
+    flightLanding_data.blue_button_double_tapped = false;
   }
 
   return allowTransition;
@@ -215,12 +221,11 @@ static bool flightLanding_private_allowTransitionRecordingToWifiOn(void)
 {
   bool allowTransition = false;
 
-  if(((millis() - flightLanding_data.time_blue_button_released_ms) > 1000U) && 
-      (flightLanding_data.blue_button_pressed == false))
+  if((flightLanding_data.blue_button_double_tapped == true))
   {
     allowTransition = true;
     pc_serial.println("RECORDING -> WIFI ON");
-
+    flightLanding_data.blue_button_double_tapped = false;
   }
 
   return allowTransition;
@@ -235,17 +240,49 @@ static bool flightLanding_private_allowTransitionRecordingToWifiOn(void)
  */
 static void flightLanding_private_processData(void)
 {
-    flightLanding_data.blue_button_pressed = digitalRead(PIN_RECORDING_BUTTON) ^ 1;
+    bool button_pressed;
 
-    //pc_serial.printf("Button: %d\n", flightLanding_data.blue_button_pressed);
+    int blue_button_read = analogRead(PIN_RECORDING_BUTTON);
+    flightLanding_data.blue_button_readings_count += 1;
+    flightLanding_data.blue_button_reading_sum += blue_button_read;
+    
+    if(flightLanding_data.blue_button_readings_count == NUM_BUTTON_READINGS)
+    {
+      int avg = flightLanding_data.blue_button_reading_sum / NUM_BUTTON_READINGS;
+
+      if(avg < BUTTON_PRESSED_CUTOFF_AVG)
+      {
+        flightLanding_data.blue_button_pressed = true;
+      }
+      else
+      {
+        flightLanding_data.blue_button_pressed = false;
+      }
+
+      flightLanding_data.blue_button_readings_count = 0;
+      flightLanding_data.blue_button_reading_sum = 0;
+    }
+
     /*
      * POSITIVE EDGE OF BLUE BUTTON
      */
     if((flightLanding_data.was_blue_button_pressed == false) && 
        (flightLanding_data.blue_button_pressed == true))
     {
-      flightLanding_data.time_blue_button_pressed_ms = millis();
-      pc_serial.println("Pressed");
+      pc_serial.println("POS EDGE");
+
+      if(millis() - flightLanding_data.time_blue_button_pressed < 1000U)
+      {
+        flightLanding_data.blue_button_double_tapped = true;
+        pc_serial.println("Double tapped");
+      }
+      else
+      {
+        flightLanding_data.blue_button_double_tapped = false;
+      }
+      
+      flightLanding_data.time_blue_button_pressed = millis();
+      
     }
     /*
      * NEGATIVE EDGE OF BLUE BUTTON PRESS
@@ -253,8 +290,7 @@ static void flightLanding_private_processData(void)
     else if((flightLanding_data.was_blue_button_pressed == true) && 
             (flightLanding_data.blue_button_pressed == false))
     {
-      flightLanding_data.time_blue_button_released_ms = millis();
-      pc_serial.println("Released");
+      pc_serial.println("NEG EDGE");
     }
 
     /*
@@ -320,6 +356,8 @@ static void flightLanding_private_setCurrentState(void)
     case STATE_WIFI_ON:
       if(flightLanding_data.state_transition == true)
       {
+        flightLanding_data.time_state_transition = millis();
+        
         // Turn on wifi
         flightLanding_private_turnOnWifi(true);
         digitalWrite(PIN_RECORDING_BUTTON_LED, LOW);
@@ -334,6 +372,7 @@ static void flightLanding_private_setCurrentState(void)
         digitalWrite(PIN_LED_RED, HIGH);
         digitalWrite(PIN_LED_GREEN, HIGH);
         digitalWrite(PIN_LED_BLUE, HIGH);
+        flightLanding_private_setupTCPServer(); 
       }
       
       /*
@@ -345,15 +384,6 @@ static void flightLanding_private_setCurrentState(void)
       {
         uint8_t system, gyro, accel, mag = 0;
         bno.getCalibration(&system, &gyro, &accel, &mag);
-        
-//        Serial.print("CALIBRATION: Sys=");
-//        Serial.print(system, DEC);
-//        Serial.print(" Gyro=");
-//        Serial.print(gyro, DEC);
-//        Serial.print(" Accel=");
-//        Serial.print(accel, DEC);
-//        Serial.print(" Mag=");
-//        Serial.println(mag, DEC);
   
         if((gyro == IMU_MAX_CALIBRATION_VALUE)  &&
            (accel == IMU_MAX_CALIBRATION_VALUE) && 
@@ -377,9 +407,54 @@ static void flightLanding_private_setCurrentState(void)
       {
         String command_string = esp_8266_serial.readString();
         pc_serial.print("ESP8266 received: "); pc_serial.println(command_string);
+
+        /*
+         * Request: A list of files
+         */
         if(command_string.indexOf(ESP8266_GET_FILES_COMMAND) != -1)
         {
            flightLanding_private_sendFileNames();
+        }
+        /*
+         * Request: Download a single or all files
+         */
+        else if(command_string.indexOf(ESP8266_COMMAND_DOWNLOAD) != -1)
+        {
+          String file_to_download = command_string.substring(command_string.indexOf('~')+1);
+          pc_serial.println(file_to_download);
+
+          File to_download = SD.open(file_to_download, FILE_READ);
+
+          if(to_download)
+          {
+            flightLanding_private_sendMessage(to_download.size());
+
+            while(to_download.available())
+            {
+              String to_send = "";
+              int num_bytes = 0;
+
+              while((num_bytes < 256) && (to_download.available()))
+              {
+                to_send += String(to_download.read());
+                num_bytes += 1;
+              }
+              
+              pc_serial.println(to_send);
+              pc_serial.println(num_bytes);
+//              flightLanding_private_sendMessage(to_send);
+            }
+
+            to_download.close();
+            flightLanding_private_sendMessage(ESP8266_COMMAND_DONE);
+            pc_serial.println("Done");
+          }
+          else
+          {
+            flightLanding_private_sendMessage("ERROR");
+          }
+
+          to_download.close();
         }
       }
 
@@ -388,6 +463,8 @@ static void flightLanding_private_setCurrentState(void)
     case STATE_RECORDING:
       if(flightLanding_data.state_transition == true)
       {        
+
+        flightLanding_data.time_state_transition = millis();
         /*
          * Turn on wifi and grab the baseline pressure
          */
@@ -513,6 +590,8 @@ static void flightLanding_private_sendFileNames()
      
      entry.close();
   }
+
+  dir.close();
 
   flightLanding_private_sendMessage(ESP8266_COMMAND_DONE);
 
@@ -677,8 +756,8 @@ static bool flightLanding_private_sendMessage(String msg)
   /**
    * Either wait a second or until data is available to be read
    */
-  while((!esp_8266_serial.available()) || 
-       ((millis() - currTime) < 200U))
+  while((!esp_8266_serial.available()))// || 
+       //((millis() - currTime) < 200U))
   {
     
   }
@@ -701,8 +780,8 @@ static bool flightLanding_private_sendMessage(String msg)
 
 
   // Wait for 'OK'
-  while((!esp_8266_serial.available()) || 
-       ((millis() - currTime) < 200U))
+  while((!esp_8266_serial.available()))// || 
+       //((millis() - currTime) < 200U))
   {
     
   }
@@ -827,8 +906,10 @@ void setup()
    */
   flightLanding_data.present_state = STATE_WIFI_ON;
   flightLanding_data.desired_state = STATE_WIFI_ON;
-  flightLanding_data.all_sensors_calibrated = false;
+  flightLanding_data.all_sensors_calibrated = true;
   flightLanding_data.last_time_collected_ms = 0U;
+  flightLanding_data.blue_button_readings_count = 0;
+  flightLanding_data.blue_button_reading_sum = 0;
 
   /*
    * INITIALIZE LED STRUCT
@@ -919,36 +1000,3 @@ void loop()
 
   flightLanding_data.was_blue_button_pressed = flightLanding_data.blue_button_pressed;
 }
-
-/**
- * Sending data through wifi
- */
-
-  // Echo what is sent into console
-  //      if(pc_serial.available())
-  //      {
-  //        esp_8266_serial.println(pc_serial.readString());
-  //      }
-  
-//        if(esp_8266_serial.available())
-//        {
-//          String send_str = esp_8266_serial.readString();
-//  
-//          // echo client
-//  #if ECHO
-//          // Header to send
-//          String send_header = String(ESP8266_SEND_STRING) + String(send_str.length());
-//          // Send the header and wait for the '>'
-//          esp_8266_serial.println(send_header);
-//          uint32_t currTime = millis();
-//          while((millis() - currTime) < 1000U);
-//          // need to check for > here
-//          // send the string
-//          esp_8266_serial.println(send_str);
-//        
-//          currTime = millis();
-//          while((millis() - currTime) < 1000U);
-//          // clear the buffer
-//          (void)esp_8266_serial.readString();
-//  #endif
-//        }
